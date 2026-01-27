@@ -39,9 +39,7 @@ def test_topp_filter(logits, topk, topp, min_tokens_to_keep):
 @bypass_not_implemented
 def test_topk_sampling(logits, topk, min_tokens_to_keep):
     top_k_sampling = MojoTopKSampling(top_k=topk, min_tokens_to_keep=min_tokens_to_keep)
-    top_k_sampling_ref = MojoTopKSampling()._registry.get("torch")(top_k=topk, min_tokens_to_keep=min_tokens_to_keep)
 
-    perf(lambda: top_k_sampling_ref(logits))  # noqa: F821
     perf(lambda: top_k_sampling(logits))  # noqa: F821
 
 
