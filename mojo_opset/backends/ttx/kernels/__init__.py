@@ -53,6 +53,8 @@ k_grouped_matmul_impl = getattr(ttx_backend_module, "k_grouped_matmul_impl")
 
 store_paged_kv_impl = getattr(ttx_backend_module, "store_paged_kv_impl")
 
+top_k_sampling_impl = getattr(ttx_backend_module, "top_k_sampling_impl")
+
 if os.getenv("MOJO_RUN_MODE", "EAGER") == "COMPILE":
     assert torch.version.__version__ >= "2.7.0", "Work with torch.compile request your torch version >= 2.7.0"
 
