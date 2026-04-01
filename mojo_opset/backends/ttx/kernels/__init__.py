@@ -34,6 +34,9 @@ gelu_bwd_impl = _get_kernel_impl(ttx_backend_module, "gelu_bwd_impl")
 silu_fwd_impl = _get_kernel_impl(ttx_backend_module, "silu_fwd_impl")
 silu_bwd_impl = _get_kernel_impl(ttx_backend_module, "silu_bwd_impl")
 
+dynamic_quant_impl = _get_kernel_impl(ttx_backend_module, "dynamic_quant_impl")
+lightning_indexer_impl = _get_kernel_impl(ttx_backend_module, "lightning_indexer_impl")
+
 rot_pos_embed_impl = _get_kernel_impl(ttx_backend_module, "rot_pos_embed_impl")
 rope_fwd_impl = _get_kernel_impl(ttx_backend_module, "rope_fwd_impl")
 rope_bwd_impl = _get_kernel_impl(ttx_backend_module, "rope_bwd_impl")
@@ -73,6 +76,9 @@ diffusion_attention_bwd_impl = _get_kernel_impl(ttx_backend_module, "diffusion_a
 
 m_grouped_matmul_impl = _get_kernel_impl(ttx_backend_module, "m_grouped_matmul_impl")
 k_grouped_matmul_impl = _get_kernel_impl(ttx_backend_module, "k_grouped_matmul_impl")
+
+int8_gemm_dequant_impl = _get_kernel_impl(ttx_backend_module, "int8_gemm_dequant_impl")
+prepare_b_impl = _get_kernel_impl(ttx_backend_module, "prepare_b_impl")
 
 store_paged_kv_impl = _get_kernel_impl(ttx_backend_module, "store_paged_kv_impl")
 
@@ -175,6 +181,30 @@ if os.getenv("MOJO_RUN_MODE", "EAGER") == "COMPILE":
         return torch.empty_like(dc), torch.empty_like(dc)
 
     # ====================================
+    # Register lightning_indexer
+    # ====================================
+
+    @torch.library.custom_op("ttx::lightning_indexer", mutates_args={})
+    def lightning_indexer(
+        query: torch.Tensor,
+        query_scale: torch.Tensor,
+        key: torch.Tensor,
+        key_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return lightning_indexer_impl(query, query_scale, key, key_scale)
+
+    @lightning_indexer.register_fake
+    def lightning_indexer_fake(
+        query: torch.Tensor,
+        query_scale: torch.Tensor,
+        key: torch.Tensor,
+        key_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, q_seq_len, _, _ = query.shape
+        k_seq_len = key.shape[1]
+        return torch.empty(batch_size, q_seq_len, k_seq_len, dtype=torch.float32, device=query.device)
+
+    # ====================================
     # Register Attention
     # ====================================
 
@@ -218,7 +248,9 @@ if os.getenv("MOJO_RUN_MODE", "EAGER") == "COMPILE":
         gqa_interleave: bool,
         softmax_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        return paged_attention_decode_impl(q, key_cache, value_cache, seqlens, block_tables, gqa_interleave, softmax_scale)
+        return paged_attention_decode_impl(
+            q, key_cache, value_cache, seqlens, block_tables, gqa_interleave, softmax_scale
+        )
 
     @paged_attention_decode.register_fake
     def paged_attention_decode_fake(
@@ -304,6 +336,27 @@ if os.getenv("MOJO_RUN_MODE", "EAGER") == "COMPILE":
         head_first: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return torch.empty_like(dq), torch.empty_like(dk)
+
+    # ====================================
+    # Register Quant
+    # ====================================
+
+    @torch.library.custom_op("ttx::dynamic_quant", mutates_args={})
+    def dynamic_quant(
+        input_tensor: torch.Tensor,
+        scale_tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return dynamic_quant_impl(input_tensor, scale_tensor)
+
+    @dynamic_quant.register_fake
+    def dynamic_quant_fake(
+        input_tensor: torch.Tensor,
+        scale_tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty_like(input_tensor, dtype=torch.int8),
+            torch.empty(*input_tensor.shape[:-1], dtype=torch.float32, device=input_tensor.device),
+        )
 
     # ====================================
     # Register rmsnorm
@@ -654,6 +707,58 @@ if os.getenv("MOJO_RUN_MODE", "EAGER") == "COMPILE":
         return torch.empty_like(C)
 
     # ====================================
+    # Register int8 gemm dequant
+    # ====================================
+    @torch.library.custom_op("ttx::int8_gemm_dequant", mutates_args={})
+    def int8_gemm_dequant(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor,
+        M: int,
+        N: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return int8_gemm_dequant_impl(
+            a,
+            b,
+            input_scale,
+            weight_scale,
+            bias,
+            M,
+            N,
+            output_dtype,
+        )
+
+    @int8_gemm_dequant.register_fake
+    def int8_gemm_dequant_fake(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.Tensor,
+        M: int,
+        N: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.zeros((M, N), dtype=output_dtype, device=a.device)
+
+    @torch.library.custom_op("ttx::prepare_b", mutates_args={})
+    def prepare_b(
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        return prepare_b_impl(
+            b,
+        )
+
+    @prepare_b.register_fake
+    def prepare_b_fake(
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(b.T)
+
+    # ====================================
     # Register Store KV
     # ====================================
 
@@ -736,6 +841,8 @@ else:
     diffusion_attention_bwd = diffusion_attention_bwd_impl
     m_grouped_matmul = m_grouped_matmul_impl
     k_grouped_matmul = k_grouped_matmul_impl
+    int8_gemm_dequant = int8_gemm_dequant_impl
+    prepare_b = prepare_b_impl
     store_paged_kv = store_paged_kv_impl
     store_label_cache_infer = store_label_cache_infer_impl
     fused_penalties_temp = fused_penalties_temp_impl
@@ -744,3 +851,5 @@ else:
     top_p_filter = top_p_filter_impl
     top_p_sampling = top_p_sampling_impl
     top_k_sampling = top_k_sampling_impl
+    dynamic_quant = dynamic_quant_impl
+    lightning_indexer = lightning_indexer_impl
